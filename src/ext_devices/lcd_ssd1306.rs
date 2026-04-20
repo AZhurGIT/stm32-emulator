@@ -13,7 +13,7 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize)]
-pub struct GpioLcdConfig {
+pub struct LcdSSD1306Config {
     pub framebuffer: String,
     pub data_pins: Option<Vec<String>>,
     pub enable_pin: Option<String>,
@@ -23,10 +23,16 @@ pub struct GpioLcdConfig {
     pub reset_pin: Option<String>,
     pub pullup_inputs: Option<Vec<String>>,
     pub led_pin: Option<String>,
+    #[serde(default = "default_scale")]
+    pub scale: usize,
 }
 
-pub struct GpioLcd {
-    pub config: GpioLcdConfig,
+fn default_scale() -> usize {
+    1
+}
+
+pub struct LcdSSD1306 {
+    pub config: LcdSSD1306Config,
     framebuffer: Rc<RefCell<dyn Framebuffer<RGB888>>>,
     name: String,
     trace_enabled: bool,
@@ -48,13 +54,13 @@ pub struct GpioLcd {
     pending_cmd: Option<PendingCommand>,
 }
 
-impl GpioLcd {
-    pub fn register(config: GpioLcdConfig, gpio: &mut GpioPorts, framebuffers: &Framebuffers) -> Result<Rc<RefCell<Self>>> {
+impl LcdSSD1306 {
+    pub fn register(config: LcdSSD1306Config, gpio: &mut GpioPorts, framebuffers: &Framebuffers) -> Result<Rc<RefCell<Self>>> {
         let framebuffer = framebuffers.get(&config.framebuffer)?;
         let self_ = Rc::new(RefCell::new(Self {
             config,
             framebuffer,
-            name: "GPIO-LCD".to_string(),
+            name: "LCD-SSD1306".to_string(),
             trace_enabled: true,
             data_bus: 0,
             page: 0,
@@ -177,7 +183,7 @@ impl GpioLcd {
         if let Some(pin) = self_.borrow().config.led_pin.clone() {
             let pin = Pin::from_str(&pin);
             gpio.add_write_callback(pin, move |_sys, v| {
-                debug!("GPIO-LCD LED={}", if v { "on" } else { "off" });
+                debug!("LCD-SSD1306 LED={}", if v { "on" } else { "off" });
             });
         }
 
@@ -289,7 +295,9 @@ impl GpioLcd {
             (c.width as usize, c.height as usize)
         };
 
-        if x >= width {
+        let scale = self.config.scale.max(1);
+
+        if x * scale >= width {
             return;
         }
 
@@ -298,13 +306,26 @@ impl GpioLcd {
 
         for bit in 0..8usize {
             let y = page * 8 + bit;
-            if y >= height {
+            if y * scale >= height {
                 break;
             }
 
             let on = (byte >> bit) & 1 != 0;
             let c = if on { 0x00FF_FFFF } else { 0x0000_0000 };
-            pixels[x + y * width] = c;
+
+            for sy in 0..scale {
+                let py = y * scale + sy;
+                if py >= height {
+                    break;
+                }
+                for sx in 0..scale {
+                    let px = x * scale + sx;
+                    if px >= width {
+                        break;
+                    }
+                    pixels[px + py * width] = c;
+                }
+            }
         }
     }
 
@@ -361,7 +382,7 @@ impl GpioLcd {
     }
 
     pub fn set_name(&mut self, index: usize) {
-        self.name = format!("GPIO-LCD{}", index);
+        self.name = format!("LCD-SSD1306-{}", index);
     }
 
     pub fn set_trace_enabled(&mut self, enabled: bool) {

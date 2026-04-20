@@ -5,14 +5,14 @@ mod usart_probe;
 mod display;
 mod lcd;
 mod touchscreen;
-mod gpio_lcd;
+mod lcd_ssd1306;
 
 use spi_flash::{SpiFlashConfig, SpiFlash};
 use usart_probe::{UsartProbeConfig, UsartProbe};
 use display::{DisplayConfig, Display};
 use lcd::{LcdConfig, Lcd};
 use touchscreen::{TouchscreenConfig, Touchscreen};
-use gpio_lcd::{GpioLcdConfig, GpioLcd};
+use lcd_ssd1306::{LcdSSD1306Config, LcdSSD1306};
 
 use std::{cell::RefCell, collections::HashSet, rc::Rc};
 use serde::Deserialize;
@@ -24,7 +24,7 @@ use crate::{system::System, framebuffers::Framebuffers, peripherals::gpio::GpioP
 #[derive(Debug, Deserialize, Default)]
 pub struct ExtDevicesConfig {
     /// Optional whitelist for external-device trace logs.
-    /// Supported keys: spi_flash, usart_probe, display, lcd, touchscreen, gpio_lcd.
+    /// Supported keys: spi_flash, usart_probe, display, lcd, touchscreen, lcd_ssd1306.
     /// If omitted, behavior is unchanged.
     pub trace_devices: Option<Vec<String>>,
     pub spi_flash: Option<Vec<SpiFlashConfig>>,
@@ -32,7 +32,7 @@ pub struct ExtDevicesConfig {
     pub display: Option<Vec<DisplayConfig>>,
     pub lcd: Option<Vec<LcdConfig>>,
     pub touchscreen: Option<Vec<TouchscreenConfig>>,
-    pub gpio_lcd: Option<Vec<GpioLcdConfig>>,
+    pub lcd_ssd1306: Option<Vec<LcdSSD1306Config>>,
 }
 
 pub struct ExtDevices {
@@ -41,7 +41,7 @@ pub struct ExtDevices {
     pub displays: Vec<Rc<RefCell<Display>>>,
     pub lcds: Vec<Rc<RefCell<Lcd>>>,
     pub touchscreens: Vec<Rc<RefCell<Touchscreen>>>,
-    pub gpio_lcds: Vec<Rc<RefCell<GpioLcd>>>,
+    pub lcd_ssd1306s: Vec<Rc<RefCell<LcdSSD1306>>>,
 }
 
 impl ExtDevices {
@@ -120,19 +120,19 @@ impl ExtDevicesConfig {
             .map(|config| Touchscreen::new(config, gpio, framebuffers).map(RefCell::new).map(Rc::new))
             .collect::<Result<_>>()?;
 
-        let gpio_lcds = self.gpio_lcd.unwrap_or_default().into_iter()
+        let lcd_ssd1306s = self.lcd_ssd1306.unwrap_or_default().into_iter()
             .enumerate()
             .map(|(i, config)| {
-                let device = GpioLcd::register(config, gpio, framebuffers)?;
+                let device = LcdSSD1306::register(config, gpio, framebuffers)?;
                 device
                     .borrow_mut()
-                    .set_trace_enabled(trace_enabled("gpio_lcd"));
+                    .set_trace_enabled(trace_enabled("lcd_ssd1306"));
                 device.borrow_mut().set_name(i);
                 Ok(device)
             })
             .collect::<Result<_>>()?;
 
-        Ok(ExtDevices { spi_flashes, usart_probes, displays, lcds, touchscreens, gpio_lcds })
+        Ok(ExtDevices { spi_flashes, usart_probes, displays, lcds, touchscreens, lcd_ssd1306s })
     }
 }
 
