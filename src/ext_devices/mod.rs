@@ -5,14 +5,16 @@ mod usart_probe;
 mod display;
 mod lcd;
 mod touchscreen;
+mod gpio_lcd;
 
 use spi_flash::{SpiFlashConfig, SpiFlash};
 use usart_probe::{UsartProbeConfig, UsartProbe};
 use display::{DisplayConfig, Display};
 use lcd::{LcdConfig, Lcd};
 use touchscreen::{TouchscreenConfig, Touchscreen};
+use gpio_lcd::{GpioLcdConfig, GpioLcd};
 
-use std::{rc::Rc, cell::RefCell};
+use std::{cell::RefCell, collections::HashSet, rc::Rc};
 use serde::Deserialize;
 use anyhow::Result;
 
@@ -21,11 +23,16 @@ use crate::{system::System, framebuffers::Framebuffers, peripherals::gpio::GpioP
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ExtDevicesConfig {
+    /// Optional whitelist for external-device trace logs.
+    /// Supported keys: spi_flash, usart_probe, display, lcd, touchscreen, gpio_lcd.
+    /// If omitted, behavior is unchanged.
+    pub trace_devices: Option<Vec<String>>,
     pub spi_flash: Option<Vec<SpiFlashConfig>>,
     pub usart_probe: Option<Vec<UsartProbeConfig>>,
     pub display: Option<Vec<DisplayConfig>>,
     pub lcd: Option<Vec<LcdConfig>>,
     pub touchscreen: Option<Vec<TouchscreenConfig>>,
+    pub gpio_lcd: Option<Vec<GpioLcdConfig>>,
 }
 
 pub struct ExtDevices {
@@ -34,6 +41,7 @@ pub struct ExtDevices {
     pub displays: Vec<Rc<RefCell<Display>>>,
     pub lcds: Vec<Rc<RefCell<Lcd>>>,
     pub touchscreens: Vec<Rc<RefCell<Touchscreen>>>,
+    pub gpio_lcds: Vec<Rc<RefCell<GpioLcd>>>,
 }
 
 impl ExtDevices {
@@ -72,16 +80,36 @@ impl ExtDevices {
 
 impl ExtDevicesConfig {
     pub fn into_ext_devices(self, gpio: &mut GpioPorts, framebuffers: &Framebuffers) -> Result<ExtDevices> {
+        let filter = self.trace_devices.as_ref().map(|v| {
+            v.iter()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect::<HashSet<_>>()
+        });
+        let trace_enabled = |name: &str| {
+            filter
+                .as_ref()
+                .map_or(true, |set| set.contains("*") || set.contains(name))
+        };
+
         let spi_flashes = self.spi_flash.unwrap_or_default().into_iter()
             .map(|config| SpiFlash::new(config).map(RefCell::new).map(Rc::new))
             .collect::<Result<_>>()?;
 
         let usart_probes = self.usart_probe.unwrap_or_default().into_iter()
-            .map(|config| UsartProbe::new(config).map(RefCell::new).map(Rc::new))
+            .map(|config| {
+                let mut dev = UsartProbe::new(config)?;
+                dev.set_trace_enabled(trace_enabled("usart_probe"));
+                Ok(Rc::new(RefCell::new(dev)))
+            })
             .collect::<Result<_>>()?;
 
         let displays = self.display.unwrap_or_default().into_iter()
-            .map(|config| Display::new(config, framebuffers).map(RefCell::new).map(Rc::new))
+            .map(|config| {
+                let mut dev = Display::new(config, framebuffers)?;
+                dev.set_trace_enabled(trace_enabled("display"));
+                Ok(Rc::new(RefCell::new(dev)))
+            })
             .collect::<Result<_>>()?;
 
         let lcds = self.lcd.unwrap_or_default().into_iter()
@@ -92,7 +120,19 @@ impl ExtDevicesConfig {
             .map(|config| Touchscreen::new(config, gpio, framebuffers).map(RefCell::new).map(Rc::new))
             .collect::<Result<_>>()?;
 
-        Ok(ExtDevices { spi_flashes, usart_probes, displays, lcds, touchscreens })
+        let gpio_lcds = self.gpio_lcd.unwrap_or_default().into_iter()
+            .enumerate()
+            .map(|(i, config)| {
+                let device = GpioLcd::register(config, gpio, framebuffers)?;
+                device
+                    .borrow_mut()
+                    .set_trace_enabled(trace_enabled("gpio_lcd"));
+                device.borrow_mut().set_name(i);
+                Ok(device)
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(ExtDevices { spi_flashes, usart_probes, displays, lcds, touchscreens, gpio_lcds })
     }
 }
 
@@ -103,4 +143,5 @@ pub trait ExtDevice<A, T> {
     fn connect_peripheral<'a>(&mut self, peri_name: &str) -> String;
     fn read(&mut self, sys: &System, addr: A) -> T;
     fn write(&mut self, sys: &System, addr: A, v: T);
+    fn available(&self) -> usize { 0 }
 }
