@@ -41,7 +41,7 @@ impl<'a, 'b> System<'a, 'b> {
                 let d = self.d.clone();
                 move |uc: &mut Unicorn<'_, ()>, addr, size, value| {
                     let mut sys = System { uc: RefCell::new(uc), p: p.clone(), d: d.clone() };
-                    p.write(&mut sys, start + addr as u32, size as u8, value as u32)
+                    p.write(&mut sys, start + addr as u32, size as u8, value)
                 }
             };
 
