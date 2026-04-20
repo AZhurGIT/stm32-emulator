@@ -3,6 +3,7 @@
 mod config;
 mod emulator;
 mod util;
+mod unicorn_ctl;
 mod peripherals;
 mod ext_devices;
 mod system;

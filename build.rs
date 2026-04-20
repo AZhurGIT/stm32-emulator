@@ -1,7 +1,7 @@
 fn main() {
-    #[cfg(target_os="macos")]
-    println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
-
-    #[cfg(target_os="linux")]
-    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    cc::Build::new()
+        .file("c/unicorn_ctl_shim.c")
+        .warnings(true)
+        .extra_warnings(false)
+        .compile("unicorn_ctl_shim");
 }
