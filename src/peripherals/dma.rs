@@ -4,18 +4,31 @@ use crate::util::UniErr;
 use crate::system::System;
 use super::Peripheral;
 use super::Peripherals;
+use super::PlatformFamily;
 
-#[derive(Default)]
 pub struct Dma {
     name: String,
+    layout: DmaLayout,
     streams: [Stream; 8],
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DmaLayout {
+    Auto,
+    F1,
+    F4,
+}
+
 impl Dma {
-    pub fn new(name: &str) -> Option<Box<dyn Peripheral>> {
+    pub fn new(name: &str, platform: PlatformFamily) -> Option<Box<dyn Peripheral>> {
         if name.starts_with("DMA") {
             let name = name.to_string();
-            Some(Box::new(Self { name, ..Self::default() }))
+            let layout = match platform {
+                PlatformFamily::Stm32F1 => DmaLayout::F1,
+                PlatformFamily::Stm32F4 => DmaLayout::F4,
+                PlatformFamily::Auto => DmaLayout::Auto,
+            };
+            Some(Box::new(Self { name, layout, streams: Default::default() }))
         } else {
             None
         }
@@ -40,8 +53,14 @@ impl Dma {
 
 impl Peripheral for Dma {
     fn read(&mut self, sys: &System, offset: u32) -> u32 {
-        if let Some((i, ch_offset)) = Self::f1_channel_access(offset) {
-            return self.streams[i].read_f1(&self.name, sys, ch_offset);
+        if self.layout != DmaLayout::F4 {
+            if let Some((i, ch_offset)) = Self::f1_channel_access(offset) {
+                return self.streams[i].read_f1(&self.name, sys, ch_offset);
+            }
+        }
+
+        if self.layout == DmaLayout::F1 {
+            return 0;
         }
 
         match Access::from_offset(offset) {
@@ -51,8 +70,14 @@ impl Peripheral for Dma {
     }
 
     fn write(&mut self, sys: &System, offset: u32, value: u32) {
-        if let Some((i, ch_offset)) = Self::f1_channel_access(offset) {
-            self.streams[i].write_f1(&self.name, sys, ch_offset, value);
+        if self.layout != DmaLayout::F4 {
+            if let Some((i, ch_offset)) = Self::f1_channel_access(offset) {
+                self.streams[i].write_f1(&self.name, sys, ch_offset, value);
+                return;
+            }
+        }
+
+        if self.layout == DmaLayout::F1 {
             return;
         }
 

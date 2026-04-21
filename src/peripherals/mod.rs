@@ -120,7 +120,7 @@ impl Peripherals {
             .or_else(||         Rcc::new(&name, self.platform))
             .or_else(||        Exti::new(&name))
             .or_else(||         I2c::new(&name))
-            .or_else(||         Dma::new(&name))
+            .or_else(||         Dma::new(&name, self.platform))
             .or_else(||         Spi::new(&name, ext_devices))
             .or_else(||       Flash::new(&name))
             .or_else(||         Tim::new(&name))
@@ -201,11 +201,15 @@ impl Peripherals {
             SoftwareSpi::register(sw_spi_config, &mut peripherals.gpio.borrow_mut(), ext_devices);
         }
 
-        let force_basic_exc_stack = svd_device.cpu.as_ref().map_or(false, |c| {
-            let n = c.name.to_ascii_lowercase();
-            // ST packs use "CM3"; other vendors may spell out "Cortex-M3".
-            n == "cm3" || n.contains("cortex-m3")
-        });
+        let force_basic_exc_stack = match peripherals.platform {
+            PlatformFamily::Stm32F1 => true,
+            PlatformFamily::Stm32F4 => false,
+            PlatformFamily::Auto => svd_device.cpu.as_ref().map_or(false, |c| {
+                let n = c.name.to_ascii_lowercase();
+                // ST packs use "CM3"; other vendors may spell out "Cortex-M3".
+                n == "cm3" || n.contains("cortex-m3")
+            }),
+        };
         peripherals.nvic.borrow_mut().force_basic_exc_stack = force_basic_exc_stack;
 
         peripherals.finish_registration();
