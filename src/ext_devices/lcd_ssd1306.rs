@@ -6,9 +6,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use crate::{
-    framebuffers::sdl_engine::{virtual_input_level, VirtualInputPin},
     framebuffers::{Framebuffer, Framebuffers, RGB888},
-    peripherals::exti,
     peripherals::gpio::{GpioPorts, Pin},
 };
 
@@ -21,7 +19,6 @@ pub struct LcdSSD1306Config {
     pub data_command_pin: Option<String>,
     pub chip_select_pin: Option<String>,
     pub reset_pin: Option<String>,
-    pub pullup_inputs: Option<Vec<String>>,
     pub led_pin: Option<String>,
     #[serde(default = "default_scale")]
     pub scale: usize,
@@ -159,27 +156,6 @@ impl LcdSSD1306 {
             });
         }
 
-        for pin_name in self_.borrow().config.pullup_inputs.clone().unwrap_or_default() {
-            let pin = Pin::from_str(&pin_name);
-            let maybe_virtual_pin = virtual_input_pin_for_name(&pin_name);
-            let maybe_exti_line = virtual_input_exti_line_for_name(&pin_name);
-            let mut prev_level: Option<bool> = None;
-            gpio.add_read_callback(pin, move |sys| {
-                let level = if let Some(vpin) = maybe_virtual_pin {
-                    virtual_input_level(vpin)
-                } else {
-                    true
-                };
-                if let (Some(line), Some(prev)) = (maybe_exti_line, prev_level) {
-                    if prev != level {
-                        exti::on_input_transition(sys, line, prev, level);
-                    }
-                }
-                prev_level = Some(level);
-                level
-            });
-        }
-
         if let Some(pin) = self_.borrow().config.led_pin.clone() {
             let pin = Pin::from_str(&pin);
             gpio.add_write_callback(pin, move |_sys, v| {
@@ -259,7 +235,7 @@ impl LcdSSD1306 {
 
         let args_needed = command_arg_count(cmd);
         if args_needed == 0 {
-            self.execute_command(cmd, &[]);
+            self.execute_command(cmd, &[][..]);
         } else {
             self.pending_cmd = Some(PendingCommand {
                 cmd,
@@ -401,29 +377,5 @@ fn command_arg_count(cmd: u8) -> usize {
         0x21 | 0x22 => 2,
         0x20 | 0x81 | 0xA8 | 0xD3 | 0xD5 | 0xD9 | 0xDA | 0xDB | 0xFD => 1,
         _ => 0,
-    }
-}
-
-fn virtual_input_pin_for_name(name: &str) -> Option<VirtualInputPin> {
-    let name = name.to_uppercase();
-    match name.as_str() {
-        "PA4" => Some(VirtualInputPin::LeftEncoderA),
-        "PA5" => Some(VirtualInputPin::LeftEncoderB),
-        "PB11" => Some(VirtualInputPin::RightEncoderA),
-        "PB13" => Some(VirtualInputPin::RightEncoderB),
-        // Firmware mapping: EXTI0 (PA0) -> right, EXTI9_5 line6 (PA6) -> left.
-        "PA0" => Some(VirtualInputPin::RightButton),
-        "PA6" => Some(VirtualInputPin::LeftButton),
-        _ => None,
-    }
-}
-
-fn virtual_input_exti_line_for_name(name: &str) -> Option<u8> {
-    let name = name.to_uppercase();
-    match name.as_str() {
-        "PA0" => Some(0),
-        "PA6" => Some(6),
-        "PB14" => Some(14),
-        _ => None,
     }
 }
