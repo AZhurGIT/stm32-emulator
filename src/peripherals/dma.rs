@@ -2,6 +2,7 @@
 
 use crate::util::UniErr;
 use crate::system::System;
+use super::meta::PeripheralMeta;
 use super::Peripheral;
 use super::Peripherals;
 use super::PlatformFamily;
@@ -20,17 +21,30 @@ enum DmaLayout {
 }
 
 impl Dma {
-    pub fn new(name: &str, platform: PlatformFamily) -> Option<Box<dyn Peripheral>> {
+    pub fn new(name: &str, platform: PlatformFamily, meta: Option<&PeripheralMeta>) -> Option<Box<dyn Peripheral>> {
         if name.starts_with("DMA") {
             let name = name.to_string();
-            let layout = match platform {
-                PlatformFamily::Stm32F1 => DmaLayout::F1,
-                PlatformFamily::Stm32F4 => DmaLayout::F4,
-                PlatformFamily::Auto => DmaLayout::Auto,
-            };
+            let layout = Self::detect_layout(platform, meta);
             Some(Box::new(Self { name, layout, streams: Default::default() }))
         } else {
             None
+        }
+    }
+
+    fn detect_layout(platform: PlatformFamily, meta: Option<&PeripheralMeta>) -> DmaLayout {
+        if let Some(meta) = meta {
+            if meta.has_register("S0CR") || meta.has_register("LISR") {
+                return DmaLayout::F4;
+            }
+            if meta.has_register("CCR1") || meta.has_register("CNDTR1") {
+                return DmaLayout::F1;
+            }
+        }
+
+        match platform {
+                PlatformFamily::Stm32F1 => DmaLayout::F1,
+                PlatformFamily::Stm32F4 => DmaLayout::F4,
+                PlatformFamily::Auto => DmaLayout::Auto,
         }
     }
 

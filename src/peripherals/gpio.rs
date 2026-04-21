@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::system::System;
+use super::meta::PeripheralMeta;
 use super::{Peripheral, PlatformFamily};
 
 use regex::Regex;
@@ -92,18 +93,38 @@ enum GpioLayout {
 }
 
 impl Gpio {
-    pub fn new(name: &str, platform: PlatformFamily) -> Option<Box<dyn Peripheral>> {
+    pub fn new(name: &str, platform: PlatformFamily, meta: Option<&PeripheralMeta>) -> Option<Box<dyn Peripheral>> {
         if let Some(block) = name.strip_prefix("GPIO") {
             let port_letter = block.chars().next().unwrap();
             let port = GpioPorts::port_index(port_letter);
-            let layout = match platform {
-                PlatformFamily::Stm32F1 => GpioLayout::F1,
-                PlatformFamily::Stm32F4 => GpioLayout::F4,
-                PlatformFamily::Auto => GpioLayout::Unknown,
-            };
+            let layout = Self::detect_layout(platform, meta);
             Some(Box::new(Self { port_letter, port, layout, ..Self::default() }))
         } else {
             None
+        }
+    }
+
+    fn detect_layout(platform: PlatformFamily, meta: Option<&PeripheralMeta>) -> GpioLayout {
+        if let Some(meta) = meta {
+            let looks_f4 = ["MODER", "OTYPER", "OSPEEDR", "PUPDR"]
+                .iter()
+                .all(|r| meta.has_register(r));
+            if looks_f4 {
+                return GpioLayout::F4;
+            }
+
+            let looks_f1 = ["CRL", "CRH", "IDR", "ODR", "BSRR", "BRR"]
+                .iter()
+                .all(|r| meta.has_register(r));
+            if looks_f1 {
+                return GpioLayout::F1;
+            }
+        }
+
+        match platform {
+                PlatformFamily::Stm32F1 => GpioLayout::F1,
+                PlatformFamily::Stm32F4 => GpioLayout::F4,
+                PlatformFamily::Auto => GpioLayout::Unknown,
         }
     }
 

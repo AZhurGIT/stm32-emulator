@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::sync::atomic::Ordering;
+use std::{collections::HashMap, sync::atomic::Ordering};
 
 use unicorn_engine::{RegisterARM, Unicorn};
 
 use crate::system::System;
+use super::meta::DeviceMeta;
 use super::Peripheral;
 
 #[derive(Default)]
@@ -29,6 +30,7 @@ pub struct Nvic {
     // 128 different interrupts. Good enough for now
     pending: u128,
     in_interrupt: bool,
+    irq_by_name: HashMap<String, i32>,
 }
 
 const IRQ_OFFSET: i32 = 16;
@@ -146,6 +148,10 @@ pub mod irq {
 // the saturn firmware to work just well enough.
 
 impl Nvic {
+    pub fn set_interrupt_map(&mut self, meta: DeviceMeta) {
+        self.irq_by_name = meta.interrupt_map().clone();
+    }
+
     pub fn set_intr_pending(&mut self, irq: i32) {
         trace!("Set irq pending irq={}", irq);
         let bit = IRQ_OFFSET + irq;

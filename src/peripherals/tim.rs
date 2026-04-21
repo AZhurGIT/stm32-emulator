@@ -1,12 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::system::System;
+use super::meta::{DeviceMeta, PeripheralMeta};
 use super::{nvic, Peripheral};
 
 #[derive(Default)]
 pub struct Tim {
     name: String,
-    is_tim4: bool,
+    update_irq: Option<i32>,
+    reg_cr1: u32,
+    reg_cr2: u32,
+    reg_smcr: u32,
+    reg_dier: u32,
+    reg_sr: u32,
+    reg_egr: u32,
+    reg_cnt: u32,
+    reg_psc: u32,
+    reg_arr: u32,
     cr1: u32,
     cr2: u32,
     smcr: u32,
@@ -19,11 +29,23 @@ pub struct Tim {
 }
 
 impl Tim {
-    pub fn new(name: &str) -> Option<Box<dyn Peripheral>> {
+    pub fn new(name: &str, device_meta: &DeviceMeta, meta: Option<&PeripheralMeta>) -> Option<Box<dyn Peripheral>> {
         if name.starts_with("TIM") {
+            let reg = |n: &str, default: u32| meta.and_then(|m| m.offset_of(n)).unwrap_or(default);
             Some(Box::new(Self {
                 name: name.to_string(),
-                is_tim4: name == "TIM4",
+                update_irq: device_meta
+                    .irq_of(name)
+                    .or_else(|| if name == "TIM4" { Some(nvic::irq::TIM4) } else { None }),
+                reg_cr1: reg("CR1", 0x0000),
+                reg_cr2: reg("CR2", 0x0004),
+                reg_smcr: reg("SMCR", 0x0008),
+                reg_dier: reg("DIER", 0x000C),
+                reg_sr: reg("SR", 0x0010),
+                reg_egr: reg("EGR", 0x0014),
+                reg_cnt: reg("CNT", 0x0024),
+                reg_psc: reg("PSC", 0x0028),
+                reg_arr: reg("ARR", 0x002C),
                 ..Self::default()
             }))
         } else {
@@ -32,7 +54,7 @@ impl Tim {
     }
 
     fn update_irq_config(&self, sys: &System) {
-        if !self.is_tim4 {
+        if self.update_irq != Some(nvic::irq::TIM4) {
             return;
         }
 
@@ -51,56 +73,58 @@ impl Tim {
 impl Peripheral for Tim {
     fn read(&mut self, sys: &System, offset: u32) -> u32 {
         match offset {
-            0x0000 => self.cr1,
-            0x0004 => self.cr2,
-            0x0008 => self.smcr,
-            0x000C => self.dier,
-            0x0010 => {
-                if self.is_tim4 && sys.p.nvic.borrow().tim4_update_pending {
+            o if o == self.reg_cr1 => self.cr1,
+            o if o == self.reg_cr2 => self.cr2,
+            o if o == self.reg_smcr => self.smcr,
+            o if o == self.reg_dier => self.dier,
+            o if o == self.reg_sr => {
+                if self.update_irq == Some(nvic::irq::TIM4) && sys.p.nvic.borrow().tim4_update_pending {
                     self.sr |= 1; // UIF
                 }
                 self.sr
             }
-            0x0014 => self.egr,
-            0x0024 => self.cnt,
-            0x0028 => self.psc,
-            0x002C => self.arr,
+            o if o == self.reg_egr => self.egr,
+            o if o == self.reg_cnt => self.cnt,
+            o if o == self.reg_psc => self.psc,
+            o if o == self.reg_arr => self.arr,
             _ => 0,
         }
     }
 
     fn write(&mut self, sys: &System, offset: u32, value: u32) {
         match offset {
-            0x0000 => {
+            o if o == self.reg_cr1 => {
                 self.cr1 = value;
                 self.update_irq_config(sys);
             }
-            0x0004 => self.cr2 = value,
-            0x0008 => self.smcr = value,
-            0x000C => {
+            o if o == self.reg_cr2 => self.cr2 = value,
+            o if o == self.reg_smcr => self.smcr = value,
+            o if o == self.reg_dier => {
                 self.dier = value;
                 self.update_irq_config(sys);
             }
-            0x0010 => {
+            o if o == self.reg_sr => {
                 self.sr = value;
-                if self.is_tim4 && (value & 1) == 0 {
+                if self.update_irq == Some(nvic::irq::TIM4) && (value & 1) == 0 {
                     sys.p.nvic.borrow_mut().clear_tim4_update_pending();
                 }
             }
-            0x0014 => {
+            o if o == self.reg_egr => {
                 self.egr = value;
-                if self.is_tim4 && (value & 1) != 0 {
+                if let Some(irq) = self.update_irq.filter(|_| (value & 1) != 0) {
                     self.sr |= 1;
-                    sys.p.nvic.borrow_mut().tim4_update_pending = true;
-                    sys.p.nvic.borrow_mut().set_intr_pending(nvic::irq::TIM4);
+                    if irq == nvic::irq::TIM4 {
+                        sys.p.nvic.borrow_mut().tim4_update_pending = true;
+                    }
+                    sys.p.nvic.borrow_mut().set_intr_pending(irq);
                 }
             }
-            0x0024 => self.cnt = value,
-            0x0028 => {
+            o if o == self.reg_cnt => self.cnt = value,
+            o if o == self.reg_psc => {
                 self.psc = value;
                 self.update_irq_config(sys);
             }
-            0x002C => {
+            o if o == self.reg_arr => {
                 self.arr = value;
                 self.update_irq_config(sys);
             }

@@ -5,22 +5,34 @@ use std::rc::Rc;
 
 use crate::ext_devices::{ExtDevices, ExtDevice};
 use crate::system::System;
+use super::meta::PeripheralMeta;
 use super::Peripheral;
 
 #[derive(Default)]
 pub struct Usart {
     pub name: String,
     pub ext_device: Option<Rc<RefCell<dyn ExtDevice<(), u8>>>>,
+    sr_offset: u32,
+    dr_offset: u32,
 }
 
 impl Usart {
-    pub fn new(name: &str, ext_devices: &ExtDevices) -> Option<Box<dyn Peripheral>> {
+    pub fn new(name: &str, ext_devices: &ExtDevices, meta: Option<&PeripheralMeta>) -> Option<Box<dyn Peripheral>> {
         if name.starts_with("USART") {
             let ext_device = ext_devices.find_serial_device(&name);
             let name = ext_device.as_ref()
                 .map(|d| d.borrow_mut().connect_peripheral(name))
                 .unwrap_or_else(|| name.to_string());
-            Some(Box::new(Self { name, ext_device, ..Default::default() }))
+            let sr_offset = meta.and_then(|m| m.offset_of("SR")).unwrap_or(0x0000);
+            let dr_offset = meta
+                .and_then(|m| m.offset_of("DR").or_else(|| m.offset_of("TDR")).or_else(|| m.offset_of("RDR")))
+                .unwrap_or(0x0004);
+            Some(Box::new(Self {
+                name,
+                ext_device,
+                sr_offset,
+                dr_offset,
+            }))
         } else {
             None
         }
@@ -30,7 +42,7 @@ impl Usart {
 impl Peripheral for Usart {
     fn read(&mut self, sys: &System, offset: u32) -> u32 {
         match offset {
-            0x0000 => {
+            o if o == self.sr_offset => {
                 // SR register
                 // Bit 7 TXE: Transmit data register empty
                 // Bit 6 TC: Transmission complete
@@ -42,7 +54,7 @@ impl Peripheral for Usart {
                 }
                 sr
             }
-            0x0004 => {
+            o if o == self.dr_offset => {
                 // DR register
                 let v = self.ext_device.as_ref().map(|d|
                     d.borrow_mut().read(sys, ())
@@ -57,7 +69,7 @@ impl Peripheral for Usart {
 
     fn write(&mut self, sys: &System, offset: u32, value: u32) {
         match offset {
-            0x0004 => {
+            o if o == self.dr_offset => {
                 // DR register
                 self.ext_device.as_ref().map(|d|
                     d.borrow_mut().write(sys, (), value as u8)
@@ -72,7 +84,7 @@ impl Peripheral for Usart {
     fn read_dma(&mut self, sys: &System, offset: u32, size: usize) -> std::collections::VecDeque<u8> {
         // USART DR over DMA should return only data that is actually present.
         // Returning synthetic zeros causes RX DMA buffers full of 0x00.
-        if offset != 0x0004 {
+        if offset != self.dr_offset {
             let mut v = std::collections::VecDeque::with_capacity(size);
             for _ in 0..size {
                 v.push_back(self.read(sys, offset) as u8);
