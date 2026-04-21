@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::system::System;
-use super::Peripheral;
+use super::{Peripheral, PlatformFamily};
 
 use regex::Regex;
 
@@ -92,11 +92,16 @@ enum GpioLayout {
 }
 
 impl Gpio {
-    pub fn new(name: &str) -> Option<Box<dyn Peripheral>> {
+    pub fn new(name: &str, platform: PlatformFamily) -> Option<Box<dyn Peripheral>> {
         if let Some(block) = name.strip_prefix("GPIO") {
             let port_letter = block.chars().next().unwrap();
             let port = GpioPorts::port_index(port_letter);
-            Some(Box::new(Self { port_letter, port, ..Self::default() }))
+            let layout = match platform {
+                PlatformFamily::Stm32F1 => GpioLayout::F1,
+                PlatformFamily::Stm32F4 => GpioLayout::F4,
+                PlatformFamily::Auto => GpioLayout::Unknown,
+            };
+            Some(Box::new(Self { port_letter, port, layout, ..Self::default() }))
         } else {
             None
         }

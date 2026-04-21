@@ -41,11 +41,24 @@ use crate::{system::System, ext_devices::ExtDevices};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct PeripheralsConfig {
+    #[serde(default)]
+    pub platform: PlatformFamily,
     pub software_spi: Option<Vec<SoftwareSpiConfig>>,
     /// Optional whitelist of peripheral names for MMIO read/write trace lines.
     /// Example: ["USART1", "DMA1", "GPIOA", "GPIOB"].
     /// If omitted, trace behavior is unchanged.
     pub trace_peripherals: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformFamily {
+    #[default]
+    Auto,
+    #[serde(alias = "stm32f1", alias = "f1")]
+    Stm32F1,
+    #[serde(alias = "stm32f4", alias = "f4")]
+    Stm32F4,
 }
 
 #[derive(Default)]
@@ -55,6 +68,7 @@ pub struct Peripherals {
     pub nvic: RefCell<Nvic>,
     pub gpio: RefCell<GpioPorts>,
     trace_peripheral_filter: Option<HashSet<String>>,
+    platform: PlatformFamily,
 }
 
 pub struct PeripheralSlot<T> {
@@ -100,10 +114,10 @@ impl Peripherals {
             .or_else(|| NvicWrapper::new(&name))
             .or_else(||     SysTick::new(&name))
             .or_else(||         Scb::new(&name))
-            .or_else(||        Gpio::new(&name))
+            .or_else(||        Gpio::new(&name, self.platform))
             .or_else(||       Usart::new(&name, ext_devices))
             .or_else(||        Fsmc::new(&name, ext_devices))
-            .or_else(||         Rcc::new(&name))
+            .or_else(||         Rcc::new(&name, self.platform))
             .or_else(||        Exti::new(&name))
             .or_else(||         I2c::new(&name))
             .or_else(||         Dma::new(&name))
@@ -136,6 +150,11 @@ impl Peripherals {
     }
 
     pub fn from_svd(mut svd_device: SvdDevice, config: PeripheralsConfig, gpio: GpioPorts, ext_devices: &ExtDevices) -> Self {
+        let platform = if config.platform == PlatformFamily::Auto {
+            Self::infer_platform(&svd_device)
+        } else {
+            config.platform
+        };
         let trace_filter = config.trace_peripherals.as_ref().map(|names| {
             names
                 .iter()
@@ -146,6 +165,7 @@ impl Peripherals {
         let mut peripherals = Self {
             gpio: RefCell::new(gpio),
             trace_peripheral_filter: trace_filter,
+            platform,
             ..Peripherals::default()
         };
 
@@ -190,6 +210,30 @@ impl Peripherals {
 
         peripherals.finish_registration();
         peripherals
+    }
+
+    fn infer_platform(svd_device: &SvdDevice) -> PlatformFamily {
+        let dev_name = svd_device.name.to_ascii_lowercase();
+        if dev_name.contains("stm32f1") {
+            return PlatformFamily::Stm32F1;
+        }
+        if dev_name.contains("stm32f4") {
+            return PlatformFamily::Stm32F4;
+        }
+
+        let cpu_name = svd_device
+            .cpu
+            .as_ref()
+            .map(|c| c.name.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        if cpu_name == "cm3" || cpu_name.contains("cortex-m3") {
+            PlatformFamily::Stm32F1
+        } else if cpu_name == "cm4" || cpu_name.contains("cortex-m4") {
+            PlatformFamily::Stm32F4
+        } else {
+            PlatformFamily::Auto
+        }
     }
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////
