@@ -6,11 +6,15 @@ pub mod usart;
 pub mod systick;
 pub mod gpio;
 pub mod dma;
+pub mod exti;
 pub mod fsmc;
 pub mod i2c;
 pub mod nvic;
 pub mod scb;
 pub mod sw_spi;
+pub mod flash;
+pub mod tim;
+pub mod meta;
 
 use rcc::*;
 use serde::Deserialize;
@@ -19,20 +23,46 @@ use usart::*;
 use systick::*;
 use gpio::*;
 use dma::*;
+use exti::*;
 use fsmc::*;
 use i2c::*;
 use nvic::*;
 use scb::*;
 use sw_spi::*;
+use flash::*;
+use tim::*;
+use meta::*;
 
-use std::{collections::{BTreeMap, VecDeque, HashMap}, cell::RefCell};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+};
 use svd_parser::svd::{RegisterInfo, Device as SvdDevice};
 
 use crate::{system::System, ext_devices::ExtDevices};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct PeripheralsConfig {
+    #[serde(default)]
+    pub platform: PlatformFamily,
+    #[serde(default = "default_true")]
+    pub use_svd_runtime_meta: bool,
     pub software_spi: Option<Vec<SoftwareSpiConfig>>,
+    /// Optional whitelist of peripheral names for MMIO read/write trace lines.
+    /// Example: ["USART1", "DMA1", "GPIOA", "GPIOB"].
+    /// If omitted, trace behavior is unchanged.
+    pub trace_peripherals: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformFamily {
+    #[default]
+    Auto,
+    #[serde(alias = "stm32f1", alias = "f1")]
+    Stm32F1,
+    #[serde(alias = "stm32f4", alias = "f4")]
+    Stm32F4,
 }
 
 #[derive(Default)]
@@ -41,6 +71,14 @@ pub struct Peripherals {
     peripherals: Vec<PeripheralSlot<RefCell<Box<dyn Peripheral>>>>,
     pub nvic: RefCell<Nvic>,
     pub gpio: RefCell<GpioPorts>,
+    device_meta: DeviceMeta,
+    use_svd_runtime_meta: bool,
+    trace_peripheral_filter: Option<HashSet<String>>,
+    platform: PlatformFamily,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub struct PeripheralSlot<T> {
@@ -56,8 +94,23 @@ impl Peripherals {
         (0xE000_0000, 0xE100_0000),
     ];
 
+    fn should_trace_addr(&self, addr: u32) -> bool {
+        let Some(filter) = self.trace_peripheral_filter.as_ref() else {
+            return true;
+        };
+        let Some(p) = Self::get_peripheral(&self.debug_peripherals, addr) else {
+            return false;
+        };
+        filter.contains(p.peripheral.name.as_str())
+    }
+
     pub fn register_peripheral(&mut self, name: String, base: u32, registers: &[RegisterInfo], ext_devices: &ExtDevices) {
         let p = GenericPeripheral::new(name.clone(), registers);
+        let peripheral_meta = if self.use_svd_runtime_meta {
+            self.device_meta.peripheral(name.as_str())
+        } else {
+            None
+        };
 
         let (start, end) = (base, base+p.size());
 
@@ -76,13 +129,16 @@ impl Peripherals {
             .or_else(|| NvicWrapper::new(&name))
             .or_else(||     SysTick::new(&name))
             .or_else(||         Scb::new(&name))
-            .or_else(||        Gpio::new(&name))
-            .or_else(||       Usart::new(&name, ext_devices))
-            .or_else(||        Fsmc::new(&name, ext_devices))
-            .or_else(||         Rcc::new(&name))
+            .or_else(||        Gpio::new(&name, self.platform, peripheral_meta))
+            .or_else(||       Usart::new(&name, ext_devices, peripheral_meta))
+            .or_else(||        Fsmc::new(&name, ext_devices, peripheral_meta))
+            .or_else(||         Rcc::new(&name, self.platform, peripheral_meta))
+            .or_else(||        Exti::new(&name, &self.device_meta, peripheral_meta))
             .or_else(||         I2c::new(&name))
-            .or_else(||         Dma::new(&name))
+            .or_else(||         Dma::new(&name, self.platform, peripheral_meta))
             .or_else(||         Spi::new(&name, ext_devices))
+            .or_else(||       Flash::new(&name))
+            .or_else(||         Tim::new(&name, &self.device_meta, peripheral_meta))
         ;
 
         if let Some(p) = p {
@@ -109,7 +165,32 @@ impl Peripherals {
     }
 
     pub fn from_svd(mut svd_device: SvdDevice, config: PeripheralsConfig, gpio: GpioPorts, ext_devices: &ExtDevices) -> Self {
-        let mut peripherals = Self { gpio: RefCell::new(gpio), .. Peripherals::default() };
+        let device_meta = if config.use_svd_runtime_meta {
+            DeviceMeta::from_svd(&svd_device)
+        } else {
+            DeviceMeta::default()
+        };
+        let inferred_platform = Self::infer_platform(&svd_device);
+        let platform = if inferred_platform == PlatformFamily::Auto {
+            config.platform
+        } else {
+            inferred_platform
+        };
+        let trace_filter = config.trace_peripherals.as_ref().map(|names| {
+            names
+                .iter()
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect::<HashSet<_>>()
+        });
+        let mut peripherals = Self {
+            gpio: RefCell::new(gpio),
+            device_meta,
+            use_svd_runtime_meta: config.use_svd_runtime_meta,
+            trace_peripheral_filter: trace_filter,
+            platform,
+            ..Peripherals::default()
+        };
 
         svd_device.peripherals.sort_by_key(|f| f.base_address);
         let svd_peripherals = svd_device.peripherals.iter()
@@ -132,7 +213,7 @@ impl Peripherals {
 
             peripherals.register_peripheral(name.to_string(), base as u32, &regs, ext_devices);
 
-            if crate::verbose() >= 3 {
+            if crate::verbose() >= 3 && peripherals.should_trace_addr(base as u32) {
                 for r in &regs {
                     trace!("p={} addr=0x{:08x} reg_name={}", p.name, p.base_address as u32 + r.address_offset, r.name);
                 }
@@ -143,8 +224,34 @@ impl Peripherals {
             SoftwareSpi::register(sw_spi_config, &mut peripherals.gpio.borrow_mut(), ext_devices);
         }
 
+        let force_basic_exc_stack = match peripherals.platform {
+            PlatformFamily::Stm32F1 => true,
+            PlatformFamily::Stm32F4 => false,
+            PlatformFamily::Auto => svd_device.cpu.as_ref().map_or(false, |c| {
+                let n = c.name.to_ascii_lowercase();
+                // ST packs use "CM3"; other vendors may spell out "Cortex-M3".
+                n == "cm3" || n.contains("cortex-m3")
+            }),
+        };
+        peripherals.nvic.borrow_mut().force_basic_exc_stack = force_basic_exc_stack;
+        peripherals
+            .nvic
+            .borrow_mut()
+            .set_interrupt_map(peripherals.device_meta.clone());
+
         peripherals.finish_registration();
         peripherals
+    }
+
+    fn infer_platform(svd_device: &SvdDevice) -> PlatformFamily {
+        let dev_name = svd_device.name.to_ascii_lowercase();
+        if dev_name.contains("stm32f1") {
+            PlatformFamily::Stm32F1
+        } else if dev_name.contains("stm32f4") {
+            PlatformFamily::Stm32F4
+        } else {
+            PlatformFamily::Auto
+        }
     }
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -188,6 +295,22 @@ impl Peripherals {
         (addr, byte_offset)
     }
 
+    /// RMW merge for sub-word stores reads the old 32-bit word. For `USART_DR` that read would
+    /// pop RX (`read DR`) and pollute the merge — use a zero baseline instead.
+    fn merge_read_old_word(&self, sys: &System, addr: u32) -> u32 {
+        if let Some(dp) = Self::get_peripheral(&self.debug_peripherals, addr) {
+            if dp.peripheral.name().starts_with("USART")
+                && (addr - dp.start)
+                    == self
+                        .offset_of(dp.peripheral.name(), "DR")
+                        .unwrap_or(0x04)
+            {
+                return 0;
+            }
+        }
+        self.read(sys, addr, 4)
+    }
+
     pub fn read(&self, sys: &System, addr: u32, size: u8) -> u32 {
         if let Some((addr, bit_number)) = Self::bitbanding(addr) {
             return (self.read(sys, addr, 1) >> bit_number) & 1;
@@ -208,19 +331,19 @@ impl Peripherals {
             0
         };
 
-        if crate::verbose() >= 3 {
+        if crate::verbose() >= 3 && self.should_trace_addr(addr) {
             trace!("read:  {} read=0x{:08x}", self.addr_desc(addr), value);
         }
 
         value
     }
 
-    pub fn write(&self, sys: &System, addr: u32, size: u8, mut value: u32) {
+    pub fn write(&self, sys: &System, addr: u32, size: u8, value: u64) {
         if let Some((addr, bit_number)) = Self::bitbanding(addr) {
             let mut v = self.read(sys, addr, 1);
             v &= 1 << bit_number;
-            v |= (value & 1) << bit_number;
-            return self.write(sys, addr, 1, v);
+            v |= ((value as u32) & 1) << bit_number;
+            return self.write(sys, addr, 1, v as u64);
         }
 
         let (addr, byte_offset) = if Self::is_register(addr) {
@@ -232,19 +355,54 @@ impl Peripherals {
 
         assert!(byte_offset + size <= 4);
 
+        let mut val32: u32 = match size {
+            1 => (value & 0xFF) as u32,
+            2 => (value & 0xFFFF) as u32,
+            4 => (value & 0xFFFF_FFFF) as u32,
+            _ => value as u32,
+        };
+
         if byte_offset != 0 {
-            let v = self.read(sys, addr, 4);
-            value = (value << 8*byte_offset) | (v & (0xFFFF_FFFF >> (32-8*byte_offset)));
+            let old = self.merge_read_old_word(sys, addr);
+            val32 = (val32 << (8 * u32::from(byte_offset)))
+                | (old & (0xFFFF_FFFFu32 >> (32 - 8 * u32::from(byte_offset))));
+        }
+
+        // USART DR (offset 0x04): sub-word stores place the character in the corresponding byte
+        // lane of the merged word. `value as u8` in Usart would then read only the low byte
+        // → zeros on the wire if the firmware used strb/strh to the upper lane (common in HAL).
+        let mut w = val32;
+        if let Some(dp) = Self::get_peripheral(&self.debug_peripherals, addr) {
+            let n = dp.peripheral.name();
+            if n.starts_with("USART")
+                && (addr - dp.start) == self.offset_of(n, "DR").unwrap_or(0x04)
+            {
+                w = match size {
+                    1 => (val32 >> (8 * u32::from(byte_offset))) & 0xFF,
+                    2 => (val32 >> (8 * u32::from(byte_offset))) & 0xFFFF,
+                    4 => val32 & 0xFF,
+                    _ => val32 & 0xFF,
+                };
+            }
         }
 
         if let Some(p) = Self::get_peripheral(&self.peripherals, addr) {
-            p.peripheral.borrow_mut().write(sys, addr - p.start, value)
+            p.peripheral.borrow_mut().write(sys, addr - p.start, w)
         }
 
-        if crate::verbose() >= 3 {
-            trace!("write: {} write=0x{:08x}", self.addr_desc(addr), value);
+        if crate::verbose() >= 3 && self.should_trace_addr(addr) {
+            trace!("write: {} write=0x{:08x}", self.addr_desc(addr), w);
         }
     }
+
+    pub fn peripheral_base(&self, peripheral_name: &str) -> Option<u32> {
+        self.device_meta.peripheral_base(peripheral_name)
+    }
+
+    pub fn offset_of(&self, peripheral_name: &str, register_name: &str) -> Option<u32> {
+        self.device_meta.offset_of(peripheral_name, register_name)
+    }
+
 }
 
 pub trait Peripheral {

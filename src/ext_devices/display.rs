@@ -26,6 +26,7 @@ pub struct ReplyConfig {
 pub struct Display {
     pub config: DisplayConfig,
     name: String,
+    trace_enabled: bool,
     draw_region: Rect,
     cmd: Option<(u8, Vec<u16>)>,
     reply: VecDeque<u16>,
@@ -44,6 +45,7 @@ impl Display {
 
         Ok(Self {
             name: "?".to_string(), // This is filled out on connect_peripheral()
+            trace_enabled: true,
             draw_region: Rect { left: 0, top: 0, right: width-1, bottom: height-1 },
             cmd: None,
             reply: Default::default(),
@@ -135,6 +137,10 @@ impl Display {
             debug!("{} cmd=0x{:02x} args={:02x?}", self.name, cmd, args);
         }
     }
+
+    pub fn set_trace_enabled(&mut self, enabled: bool) {
+        self.trace_enabled = enabled;
+    }
 }
 
 impl ExtDevice<u32, u32> for Display {
@@ -155,13 +161,17 @@ impl ExtDevice<u32, u32> for Display {
             }
         };
 
-        trace!("{} READ {:?} -> {:02x}", self.name, mode, v);
+        if self.trace_enabled {
+            trace!("{} READ {:?} -> {:02x}", self.name, mode, v);
+        }
         v as u32
     }
 
     fn write(&mut self, _sys: &System, addr: u32, value: u32) {
         let mode = Mode::from_addr(self.config.cmd_addr_bit, addr);
-        trace!("{} WRITE {:?} value=0x{:04x}", self.name, mode, value as u16);
+        if self.trace_enabled {
+            trace!("{} WRITE {:?} value=0x{:04x}", self.name, mode, value as u16);
+        }
         match mode {
             Mode::Cmd => {
                 self.finish_cmd();

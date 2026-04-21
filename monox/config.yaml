@@ -29,6 +29,7 @@ framebuffers:
     sdl: true
     downscale: 8
 peripherals:
+  platform: stm32f4
   software_spi:
     - name: SW_SPI_TOUCH
       cs: PD12

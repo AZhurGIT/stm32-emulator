@@ -30,6 +30,7 @@ framebuffers:
   #  mode: gray8
   #  sdl: true
 peripherals:
+  platform: stm32f4
   software_spi:
     - name: SW_SPI_LCD
       cs: PA15

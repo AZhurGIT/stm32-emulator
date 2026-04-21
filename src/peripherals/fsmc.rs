@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::{system::System, ext_devices::{ExtDevices, ExtDevice}};
+use super::meta::PeripheralMeta;
 use super::Peripheral;
 
 pub struct Fsmc {
     banks: [Bank; 4],
+    register_access: HashMap<u32, (usize, Reg)>,
 }
 
 impl Fsmc {
-    pub fn new(name: &str, ext_devices: &ExtDevices) -> Option<Box<dyn Peripheral>> {
+    pub fn new(name: &str, ext_devices: &ExtDevices, meta: Option<&PeripheralMeta>) -> Option<Box<dyn Peripheral>> {
         if name.starts_with("FSMC") {
             let banks = [
                 Bank::new(0, ext_devices),
@@ -18,49 +20,93 @@ impl Fsmc {
                 Bank::new(2, ext_devices),
                 Bank::new(3, ext_devices),
             ];
-            Some(Box::new(Self { banks }))
+            Some(Box::new(Self {
+                banks,
+                register_access: Self::register_access_from_meta(meta),
+            }))
         } else {
             None
         }
     }
 
-    fn access(offset: u32) -> Access {
+    fn register_access_from_meta(meta: Option<&PeripheralMeta>) -> HashMap<u32, (usize, Reg)> {
+        let mut map = HashMap::new();
+        let Some(meta) = meta else {
+            return map;
+        };
+
+        let mut add_bank = |bank: usize, name: String, reg: Reg| {
+            if let Some(offset) = meta.offset_of(name.as_str()) {
+                map.insert(offset, (bank, reg));
+            }
+        };
+
+        for bank in 0..4usize {
+            let b = bank + 1;
+            add_bank(bank, format!("BCR{}", b), Reg::BCR);
+            add_bank(bank, format!("BTR{}", b), Reg::BTR);
+            add_bank(bank, format!("BWTR{}", b), Reg::BWTR);
+        }
+        for bank in 1..4usize {
+            let b = bank + 1;
+            add_bank(bank, format!("PCR{}", b), Reg::PCR);
+            add_bank(bank, format!("SR{}", b), Reg::SR);
+            add_bank(bank, format!("PMEM{}", b), Reg::PMEM);
+            add_bank(bank, format!("PATT{}", b), Reg::PATT);
+            add_bank(bank, format!("ECCR{}", b), Reg::ECCR);
+        }
+        add_bank(3, "PIO4".to_string(), Reg::PIO);
+
+        map
+    }
+
+    fn fallback_register_access(offset: u32) -> (usize, Reg) {
+        match offset {
+            0x0000 => (0, Reg::BCR),
+            0x0004 => (0, Reg::BTR),
+            0x0008 => (1, Reg::BCR),
+            0x000C => (1, Reg::BTR),
+            0x0010 => (2, Reg::BCR),
+            0x0014 => (2, Reg::BTR),
+            0x0018 => (3, Reg::BCR),
+            0x001C => (3, Reg::BTR),
+            0x0060 => (1, Reg::PCR),
+            0x0064 => (1, Reg::SR),
+            0x0068 => (1, Reg::PMEM),
+            0x006C => (1, Reg::PATT),
+            0x0074 => (1, Reg::ECCR),
+            0x0080 => (2, Reg::PCR),
+            0x0084 => (2, Reg::SR),
+            0x0088 => (2, Reg::PMEM),
+            0x008C => (2, Reg::PATT),
+            0x0094 => (2, Reg::ECCR),
+            0x00A0 => (3, Reg::PCR),
+            0x00A4 => (3, Reg::SR),
+            0x00A8 => (3, Reg::PMEM),
+            0x00AC => (3, Reg::PATT),
+            0x00B0 => (3, Reg::PIO),
+            0x0104 => (0, Reg::BWTR),
+            0x010C => (1, Reg::BWTR),
+            0x0114 => (2, Reg::BWTR),
+            0x011C => (3, Reg::BWTR),
+            _ => (0, Reg::Invalid),
+        }
+    }
+
+    fn access(&self, offset: u32) -> Access {
         match offset {
             0x0000_0000..=0x0fff_ffff => Access::Data(0, offset),
             0x1000_0000..=0x1fff_ffff => Access::Data(1, offset - 0x1000_0000),
             0x2000_0000..=0x2fff_ffff => Access::Data(2, offset - 0x2000_0000),
             0x3000_0000..=0x3fff_ffff => Access::Data(3, offset - 0x3000_0000),
             0x4000_0000..=0x4fff_ffff => {
-                match offset - 0x4000_0000 {
-                    0x0000 => Access::Register(0, Reg::BCR),
-                    0x0004 => Access::Register(0, Reg::BTR),
-                    0x0008 => Access::Register(1, Reg::BCR),
-                    0x000C => Access::Register(1, Reg::BTR),
-                    0x0010 => Access::Register(2, Reg::BCR),
-                    0x0014 => Access::Register(2, Reg::BTR),
-                    0x0018 => Access::Register(3, Reg::BCR),
-                    0x001C => Access::Register(3, Reg::BTR),
-                    0x0060 => Access::Register(1, Reg::PCR),
-                    0x0064 => Access::Register(1, Reg::SR),
-                    0x0068 => Access::Register(1, Reg::PMEM),
-                    0x006C => Access::Register(1, Reg::PATT),
-                    0x0074 => Access::Register(1, Reg::ECCR),
-                    0x0080 => Access::Register(2, Reg::PCR),
-                    0x0084 => Access::Register(2, Reg::SR),
-                    0x0088 => Access::Register(2, Reg::PMEM),
-                    0x008C => Access::Register(2, Reg::PATT),
-                    0x0094 => Access::Register(2, Reg::ECCR),
-                    0x00A0 => Access::Register(3, Reg::PCR),
-                    0x00A4 => Access::Register(3, Reg::SR),
-                    0x00A8 => Access::Register(3, Reg::PMEM),
-                    0x00AC => Access::Register(3, Reg::PATT),
-                    0x00B0 => Access::Register(3, Reg::PIO),
-                    0x0104 => Access::Register(0, Reg::BWTR),
-                    0x010C => Access::Register(1, Reg::BWTR),
-                    0x0114 => Access::Register(2, Reg::BWTR),
-                    0x011C => Access::Register(3, Reg::BWTR),
-                    _ => Access::Register(0, Reg::Invalid),
-                }
+                let reg_offset = offset - 0x4000_0000;
+                let (bank, reg) = self
+                    .register_access
+                    .get(&reg_offset)
+                    .copied()
+                    .unwrap_or_else(|| Self::fallback_register_access(reg_offset));
+                Access::Register(bank, reg)
             }
             _ => unreachable!()
         }
@@ -69,14 +115,14 @@ impl Fsmc {
 
 impl Peripheral for Fsmc {
     fn read(&mut self, sys: &System, offset: u32) -> u32 {
-        match Self::access(offset) {
+        match self.access(offset) {
             Access::Data(bank, offset) => self.banks[bank].read_data(sys, offset),
             Access::Register(bank, reg) => self.banks[bank].read_reg(sys, reg),
         }
     }
 
     fn write(&mut self, sys: &System, offset: u32, value: u32) {
-        match Self::access(offset) {
+        match self.access(offset) {
             Access::Data(bank, offset) => self.banks[bank].write_data(sys, offset, value),
             Access::Register(bank, reg) => self.banks[bank].write_reg(sys, reg, value),
         }
@@ -139,7 +185,7 @@ enum Access {
     Register(usize, Reg),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Reg {
     BCR,
     BTR,

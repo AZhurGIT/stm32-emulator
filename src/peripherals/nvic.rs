@@ -1,27 +1,146 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::sync::atomic::Ordering;
+use std::{collections::HashMap, sync::atomic::Ordering};
 
 use unicorn_engine::{RegisterARM, Unicorn};
 
 use crate::system::System;
+use super::meta::DeviceMeta;
 use super::Peripheral;
 
 #[derive(Default)]
 pub struct Nvic {
     pub systick_period: Option<u32>,
     pub last_systick_trigger: u64,
+    pub tim4_period: Option<u32>,
+    pub last_tim4_trigger: u64,
+    pub tim4_update_pending: bool,
+
+    /// Cortex-M3 does not implement CONTROL.FPCA (bit 2); it is RES0 in the
+    /// architecture but QEMU may expose a non-zero value. Treating that as
+    /// "floating-point context active" builds the wrong EXC_RETURN and pops
+    /// an extended exception frame, corrupting MSP vs our basic `push_regs`.
+    pub force_basic_exc_stack: bool,
+
+    /// Shadow of NVIC ISER0..2 (IRQ 0..95 enable). Writes were previously ignored,
+    /// so firmware NVIC_EnableIRQ() had no effect and we could deliver TIM4 before
+    /// the vector was armed — confusing init and stack usage.
+    iser: [u32; 3],
 
     // 128 different interrupts. Good enough for now
     pending: u128,
     in_interrupt: bool,
+    irq_by_name: HashMap<String, i32>,
 }
 
 const IRQ_OFFSET: i32 = 16;
 
+/// EPSR [15:10] IT state and [26:25] ICI — cleared in the **stacked** xPSR on
+/// hardware exception entry (ARMv7-M). If we inject an IRQ while the guest
+/// sits inside an IT block, keeping these bits breaks condexec after return.
+const XPSR_IT_ICI_MASK: u32 = 0x0600_FC00;
+
+fn read_u16_le(uc: &Unicorn<()>, addr: u32) -> Option<u16> {
+    let mut b = [0u8; 2];
+    uc.mem_read(addr as u64, &mut b).ok()?;
+    Some(u16::from_le_bytes(b))
+}
+
+/// First halfword of a 32-bit Thumb-2 instruction (ARM DDI 0406 A5.1).
+fn thumb32_first_halfword(h: u16) -> bool {
+    let op = (h >> 11) & 0x1f;
+    matches!(op, 0x1d | 0x1e | 0x1f)
+}
+
+fn thumb_instruction_size(h0: u16) -> u32 {
+    if thumb32_first_halfword(h0) {
+        4
+    } else {
+        2
+    }
+}
+
+/// Number of conditional instructions in an IT block from the IT instruction's low nibble.
+/// See ARMv7-M ARM IT encoding (`mask` field): uses `4 - ctz(mask | 0x10)`.
+fn it_block_conditional_instruction_count(mask_lo: u8) -> Option<usize> {
+    let m = mask_lo & 0xf;
+    if m == 0 {
+        return None;
+    }
+    let x = u32::from(m | 0x10);
+    Some((4 - x.trailing_zeros()) as usize)
+}
+
+/// True if `pc` points into one of the conditional instructions following an `IT` at `it_addr`.
+fn pc_in_it_block_after(uc: &Unicorn<()>, it_addr: u32, pc: u32) -> bool {
+    let h = match read_u16_le(uc, it_addr) {
+        Some(v) => v,
+        None => return false,
+    };
+    if (h >> 8) != 0xbf || h == 0xbf00 {
+        return false;
+    }
+    let n = match it_block_conditional_instruction_count((h & 0xff) as u8) {
+        Some(n) => n,
+        None => return false,
+    };
+    let mut p = it_addr.wrapping_add(2);
+    if pc < p {
+        return false;
+    }
+    for _ in 0..n {
+        let hw = match read_u16_le(uc, p) {
+            Some(v) => v,
+            None => return false,
+        };
+        let len = thumb_instruction_size(hw);
+        let end = p.wrapping_add(len);
+        if pc >= p && pc < end {
+            return true;
+        }
+        p = end;
+    }
+    false
+}
+
+/// If `pc` lies inside a Thumb IT block (decoded from memory), do not inject an IRQ — Unicorn
+/// often omits ITSTATE on the boundary after `ite` / `it` (see e.g. `ite eq` at 0x08000520).
+fn thumb_pc_inside_it_block_from_memory(uc: &Unicorn<()>, pc: u32) -> bool {
+    // Prefer the IT closest to `pc` (largest `it_addr`): scan small deltas first.
+    let mut best = false;
+    for delta in (2..=24).step_by(2) {
+        let it_addr = pc.wrapping_sub(delta);
+        if pc_in_it_block_after(uc, it_addr, pc) {
+            best = true;
+            break;
+        }
+    }
+    best
+}
+
+fn guest_in_it_block(uc: &Unicorn<()>) -> bool {
+    // QEMU exposes Thumb IT execution state separately from xPSR (RegisterARM::ITSTATE).
+    // Delivery from a code hook while non-zero can leave the CPU running IT epilogue in the
+    // old TB after we set PC → `ldr pc,[sp]` loads 0 / corrupts flow (PREFETCH_ABORT to 0x0).
+    if let Ok(v) = uc.reg_read(RegisterARM::ITSTATE) {
+        if (v as u32) & 0xff != 0 {
+            return true;
+        }
+    }
+    let xpsr = uc.reg_read(RegisterARM::XPSR).unwrap_or(0) as u32;
+    if (xpsr & XPSR_IT_ICI_MASK) != 0 {
+        return true;
+    }
+    // Unicorn may clear ITSTATE/xPSR IT bits between IT and the conditional insns (e.g. at
+    // 0x08000522 after `ite eq` at 0x08000520); decode IT blocks from memory as a fallback.
+    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+    thumb_pc_inside_it_block_from_memory(uc, pc)
+}
+
 pub mod irq {
     pub const PENDSV: i32 = -2;
     pub const SYSTICK: i32 = -1;
+    pub const TIM4: i32 = 30;
 }
 
 // This is all poorly implemented. If this is not making much sense, it might be
@@ -29,6 +148,10 @@ pub mod irq {
 // the saturn firmware to work just well enough.
 
 impl Nvic {
+    pub fn set_interrupt_map(&mut self, meta: DeviceMeta) {
+        self.irq_by_name = meta.interrupt_map().clone();
+    }
+
     pub fn set_intr_pending(&mut self, irq: i32) {
         trace!("Set irq pending irq={}", irq);
         let bit = IRQ_OFFSET + irq;
@@ -36,15 +159,33 @@ impl Nvic {
         self.pending |= 1 << (IRQ_OFFSET + irq);
     }
 
-    pub fn get_and_clear_next_intr_pending(&mut self) -> Option<i32> {
-        if self.pending != 0 {
-            let bit = self.pending.trailing_zeros();
-            self.pending &= !(1 << bit);
+    /// Takes the lowest pending IRQ whose NVIC enable bit is set (ISER); skips
+    /// disabled lines but leaves them pending (STM32 IRQn maps to ISER bits).
+    fn pop_next_deliverable_pending(&mut self) -> Option<i32> {
+        let mut mask = self.pending;
+        while mask != 0 {
+            let bit = mask.trailing_zeros();
             let irq = (bit as i32) - IRQ_OFFSET;
-            Some(irq)
-        } else {
-            None
+            if self.irq_line_enabled(irq) {
+                self.pending &= !(1u128 << bit);
+                return Some(irq);
+            }
+            mask &= !(1u128 << bit);
         }
+        None
+    }
+
+    fn irq_line_enabled(&self, irq: i32) -> bool {
+        if irq < 0 {
+            // SysTick / PendSV are not enabled via NVIC ISER; gated elsewhere for now.
+            return true;
+        }
+        let n = irq as u32;
+        let idx = (n / 32) as usize;
+        if idx >= self.iser.len() {
+            return false;
+        }
+        (self.iser[idx] & (1 << (n % 32))) != 0
     }
 
     pub fn maybe_set_systick_intr_pending(&mut self) {
@@ -58,21 +199,51 @@ impl Nvic {
         }
     }
 
+    pub fn maybe_set_tim4_intr_pending(&mut self) {
+        if let Some(tim4_period) = self.tim4_period {
+            let n = crate::emulator::NUM_INSTRUCTIONS.load(Ordering::Relaxed);
+            let delta_num_instructions = n - self.last_tim4_trigger;
+            if delta_num_instructions > (tim4_period as u64) {
+                self.last_tim4_trigger = n;
+                self.tim4_update_pending = true;
+                self.set_intr_pending(irq::TIM4);
+            }
+        }
+    }
+
+    pub fn clear_tim4_update_pending(&mut self) {
+        self.tim4_update_pending = false;
+    }
+
    fn are_interrupts_disabled(sys: &System) -> bool {
         let primask = sys.uc.borrow().reg_read(RegisterARM::PRIMASK).unwrap();
         primask != 0
     }
 
-    pub fn run_pending_interrupts(&mut self, sys: &System, vector_table_addr: u32) {
+    /// Returns `true` if a synthetic IRQ was taken (`PC` set to the vector).
+    /// The caller should end the current `emu_start` (e.g. `emu_stop()`) so
+    /// Unicorn leaves the partially-translated TB: otherwise `reg_write(PC)`
+    /// from a code hook can be ignored inside an IT block (see QEMU
+    /// `no_exit_request` / `UC_HOOK_FLAG_NO_STOP`).
+    pub fn run_pending_interrupts(&mut self, sys: &System, vector_table_addr: u32) -> bool {
         self.maybe_set_systick_intr_pending();
+        self.maybe_set_tim4_intr_pending();
 
         if Self::are_interrupts_disabled(sys) || self.in_interrupt {
-            return;
+            return false;
         }
 
-        if let Some(irq) = self.get_and_clear_next_intr_pending() {
+        if let Some(irq) = self.pop_next_deliverable_pending() {
+            if guest_in_it_block(&sys.uc.borrow()) {
+                // Retry on a later instruction boundary — do not consume pending.
+                let bit = (IRQ_OFFSET + irq) as u32;
+                self.pending |= 1u128 << bit;
+                return false;
+            }
             self.run_interrupt(sys, vector_table_addr, irq);
+            return true;
         }
+        false
     }
 
     fn read_vector_addr(sys: &System, vector_table_addr: u32, irq: i32) -> u32 {
@@ -96,12 +267,19 @@ impl Nvic {
         // FPCA, bit[2], if the processor includes the FP extension.
         let control_reg = uc.reg_read(RegisterARM::CONTROL).unwrap();
         let spsel = control_reg & (1 << 1) != 0;
-        let fpca = control_reg & (2 << 1) != 0;
+        let fpca = !self.force_basic_exc_stack && (control_reg & (1 << 2) != 0);
 
         trace!("Running interrupt irq={} spsel={} fpca={} vector={:#08x}",
             irq, spsel, fpca, vector);
 
         Self::push_regs(&mut uc, spsel, fpca);
+
+        // Match hardware: EPSR.IT/ICI cleared for execution in the handler.
+        let xpsr = uc.reg_read(RegisterARM::XPSR).unwrap() as u32;
+        uc.reg_write(RegisterARM::XPSR, (xpsr & !XPSR_IT_ICI_MASK).into())
+            .unwrap();
+        // Exception entry clears the Thumb IT state machine (not only xPSR bits).
+        let _ = uc.reg_write(RegisterARM::ITSTATE, 0);
 
         // LR meaning:
         //   EXC_RETURN    Return to      Return stack Frame type
@@ -130,23 +308,28 @@ impl Nvic {
         let lr = uc.reg_read(RegisterARM::LR).unwrap();
         if lr & 0xFFFF_FF00 == 0xFFFF_FF00 {
             let spsel = lr & 0b0000_0100 != 0;
-            let fpca = lr & 0b0001_0000 == 0; // 0 means yes here
+            // EXC_RETURN bit 4 (FTYPE): 0 => extended frame, 1 => basic. M3 has no FP
+            // extended frame; if LR is wrong, never pop 17 extra words off MSP.
+            let mut extended_frame = lr & 0b0001_0000 == 0;
+            if self.force_basic_exc_stack {
+                extended_frame = false;
+            }
 
-            Self::pop_regs(&mut uc, spsel, fpca);
+            Self::pop_regs(&mut uc, spsel, extended_frame);
 
-            trace!("Return from interrupt spsel={} fpca={} pc=0x{:08x}",
-                spsel, fpca, uc.reg_read(RegisterARM::PC).unwrap());
+            trace!("Return from interrupt spsel={} extended_frame={} pc=0x{:08x}",
+                spsel, extended_frame, uc.reg_read(RegisterARM::PC).unwrap());
 
             // SPSEL, bit[1], 0 means we use MSP, 1 means we use PSP.
             // FPCA, bit[2], if the processor includes the FP extension.
             let mut control_reg = 0;
             if spsel { control_reg |= 1 << 1; }
-            if fpca { control_reg |= 2 << 1; }
+            if extended_frame { control_reg |= 2 << 1; }
             uc.reg_write(RegisterARM::CONTROL, control_reg).unwrap();
         } else {
             let control_reg = uc.reg_read(RegisterARM::CONTROL).unwrap();
             let spsel = control_reg & (1 << 1) != 0;
-            let fpca = control_reg & (2 << 1) != 0;
+            let fpca = !self.force_basic_exc_stack && (control_reg & (1 << 2) != 0);
             Self::pop_regs(&mut uc, spsel, fpca);
 
             trace!("Return from interrupt spsel={} fpca={} pc=0x{:08x} -- LR was not right",
@@ -192,7 +375,10 @@ impl Nvic {
         let mut sp = uc.reg_read(sp_reg).unwrap();
 
         let mut push_reg = |reg| {
-            let v = uc.reg_read(reg).unwrap() as u32;
+            let mut v = uc.reg_read(reg).unwrap() as u32;
+            if reg == RegisterARM::XPSR {
+                v &= !XPSR_IT_ICI_MASK;
+            }
             //trace!("push sp=0x{:08x} {:5?}=0x{:08x}", sp, reg, v);
             sp -= 4;
             uc.mem_write(sp, &v.to_le_bytes()).expect("Invalid SP pointer during interrupt");
@@ -235,11 +421,32 @@ impl Nvic {
 }
 
 impl Peripheral for Nvic {
-    fn read(&mut self, _sys: &System, _offset: u32) -> u32 {
-        0
+    fn read(&mut self, _sys: &System, offset: u32) -> u32 {
+        match offset {
+            0x100..=0x108 | 0x180..=0x188 => {
+                let i = ((offset & 0x0f) >> 2) as usize;
+                self.iser.get(i).copied().unwrap_or(0)
+            }
+            _ => 0,
+        }
     }
 
-    fn write(&mut self, _sys: &System, _offset: u32, _value: u32) {
+    fn write(&mut self, _sys: &System, offset: u32, value: u32) {
+        match offset {
+            0x100..=0x108 => {
+                let i = ((offset - 0x100) / 4) as usize;
+                if i < 3 {
+                    self.iser[i] |= value;
+                }
+            }
+            0x180..=0x188 => {
+                let i = ((offset - 0x180) / 4) as usize;
+                if i < 3 {
+                    self.iser[i] &= !value;
+                }
+            }
+            _ => {}
+        }
     }
 }
 

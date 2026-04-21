@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::system::System;
-use super::Peripheral;
+use super::meta::PeripheralMeta;
+use super::{Peripheral, PlatformFamily};
 
 use regex::Regex;
 
@@ -80,16 +81,50 @@ pub struct Gpio {
     lck: u32,
     afrl: u32,
     afrh: u32,
+    layout: GpioLayout,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum GpioLayout {
+    #[default]
+    Unknown,
+    F1,
+    F4,
 }
 
 impl Gpio {
-    pub fn new(name: &str) -> Option<Box<dyn Peripheral>> {
+    pub fn new(name: &str, platform: PlatformFamily, meta: Option<&PeripheralMeta>) -> Option<Box<dyn Peripheral>> {
         if let Some(block) = name.strip_prefix("GPIO") {
             let port_letter = block.chars().next().unwrap();
             let port = GpioPorts::port_index(port_letter);
-            Some(Box::new(Self { port_letter, port, ..Self::default() }))
+            let layout = Self::detect_layout(platform, meta);
+            Some(Box::new(Self { port_letter, port, layout, ..Self::default() }))
         } else {
             None
+        }
+    }
+
+    fn detect_layout(platform: PlatformFamily, meta: Option<&PeripheralMeta>) -> GpioLayout {
+        if let Some(meta) = meta {
+            let looks_f4 = ["MODER", "OTYPER", "OSPEEDR", "PUPDR"]
+                .iter()
+                .all(|r| meta.has_register(r));
+            if looks_f4 {
+                return GpioLayout::F4;
+            }
+
+            let looks_f1 = ["CRL", "CRH", "IDR", "ODR", "BSRR", "BRR"]
+                .iter()
+                .all(|r| meta.has_register(r));
+            if looks_f1 {
+                return GpioLayout::F1;
+            }
+        }
+
+        match platform {
+                PlatformFamily::Stm32F1 => GpioLayout::F1,
+                PlatformFamily::Stm32F4 => GpioLayout::F4,
+                PlatformFamily::Auto => GpioLayout::Unknown,
         }
     }
 
@@ -111,6 +146,46 @@ impl Gpio {
     fn port_str(&self, pin: u8) -> String {
         format!("GPIO{} P{}{}", self.port_letter, self.port_letter, pin)
     }
+
+    fn write_odr(&mut self, sys: &System, value: u32) {
+        let mut gpio = sys.p.gpio.borrow_mut();
+        Self::iter_port_reg_changes(self.od, value, 1, |pin, v| {
+            gpio.write_port(sys, self.port, pin, v != 0);
+            trace!("{} output={}", self.port_str(pin), v);
+        });
+        self.od = value;
+    }
+
+    fn write_bsrr(&mut self, sys: &System, value: u32) {
+        let reset = value >> 16;
+        let set = value & 0xFFFF;
+        let mut gpio = sys.p.gpio.borrow_mut();
+
+        Self::iter_port_reg_changes(0, set, 1, |pin, _| {
+            gpio.write_port(sys, self.port, pin, true);
+            trace!("{} output=1", self.port_str(pin));
+        });
+
+        Self::iter_port_reg_changes(0, reset, 1, |pin, _| {
+            gpio.write_port(sys, self.port, pin, false);
+            trace!("{} output=0", self.port_str(pin));
+        });
+
+        self.od &= !reset;
+        self.od |= set;
+    }
+
+    fn write_brr(&mut self, sys: &System, value: u32) {
+        let reset = value & 0xFFFF;
+        let mut gpio = sys.p.gpio.borrow_mut();
+
+        Self::iter_port_reg_changes(0, reset, 1, |pin, _| {
+            gpio.write_port(sys, self.port, pin, false);
+            trace!("{} output=0", self.port_str(pin));
+        });
+
+        self.od &= !reset;
+    }
 }
 
 impl Peripheral for Gpio {
@@ -118,12 +193,30 @@ impl Peripheral for Gpio {
         match offset {
             0x0000 => self.mode,
             0x0004 => self.otype,
-            0x0008 => self.ospeed,
-            0x000C => self.pupd,
+            0x0008 => {
+                if self.layout == GpioLayout::F1 {
+                    let v = sys.p.gpio.borrow_mut().read_port(sys, self.port);
+                    trace!("GPIO{} read v=0x{:04x}", self.port_letter, v);
+                    v as u32
+                } else {
+                    self.ospeed
+                }
+            }
+            0x000C => {
+                if self.layout == GpioLayout::F1 {
+                    self.od
+                } else {
+                    self.pupd
+                }
+            }
             0x0010 => {
-                let v = sys.p.gpio.borrow_mut().read_port(sys, self.port);
-                trace!("GPIO{} read v=0x{:04x}", self.port_letter, v);
-                v as u32
+                if self.layout == GpioLayout::F1 {
+                    0
+                } else {
+                    let v = sys.p.gpio.borrow_mut().read_port(sys, self.port);
+                    trace!("GPIO{} read v=0x{:04x}", self.port_letter, v);
+                    v as u32
+                }
             }
             0x0014 => self.od,
             0x0018 => 0, // bsr
@@ -177,58 +270,67 @@ impl Peripheral for Gpio {
                 self.ospeed = value;
             }
             0x000C => {
-                Self::iter_port_reg_changes(self.pupd, value, 2, |pin, v| {
-                    let config = match v {
-                        0b00 => "regular",
-                        0b01 => "pull-up",
-                        0b10 => "pull-down",
-                        0b11 => "reserved",
-                        _ => unreachable!(),
-                    };
-                    trace!("{} input_cfg={}", self.port_str(pin), config);
-                });
-                self.pupd = value;
+                if self.layout == GpioLayout::F1 {
+                    self.write_odr(sys, value);
+                } else {
+                    Self::iter_port_reg_changes(self.pupd, value, 2, |pin, v| {
+                        let config = match v {
+                            0b00 => "regular",
+                            0b01 => "pull-up",
+                            0b10 => "pull-down",
+                            0b11 => "reserved",
+                            _ => unreachable!(),
+                        };
+                        trace!("{} input_cfg={}", self.port_str(pin), config);
+                    });
+                    self.pupd = value;
+                }
             }
             0x0010 => {
-                // input data register. read-only
+                // F1 BSRR write, F4 IDR read-only
+                self.layout = GpioLayout::F1;
+                self.write_bsrr(sys, value);
             }
             0x0014 => {
-                let mut gpio = sys.p.gpio.borrow_mut();
-                Self::iter_port_reg_changes(self.od, value, 1, |pin, v| {
-                    gpio.write_port(sys, self.port, pin, v != 0);
-                    trace!("{} output={}", self.port_str(pin), v);
-                });
-                self.od = value;
+                match self.layout {
+                    GpioLayout::F1 => self.write_brr(sys, value),
+                    GpioLayout::F4 => self.write_odr(sys, value),
+                    GpioLayout::Unknown => {
+                        // F1 uses BRR at 0x14 (bit-reset register), while F4 uses ODR.
+                        // If layout is still unknown, a masked low-16 write strongly suggests F1.
+                        if (value & 0xFFFF_0000) == 0 {
+                            self.layout = GpioLayout::F1;
+                            self.write_brr(sys, value);
+                        } else {
+                            self.layout = GpioLayout::F4;
+                            self.write_odr(sys, value);
+                        }
+                    }
+                }
             }
             0x0018 => {
-                let reset = value >> 16;
-                let set = value & 0xFFFF;
-                let mut gpio = sys.p.gpio.borrow_mut();
-
-                Self::iter_port_reg_changes(0, set, 1, |pin, _| {
-                    gpio.write_port(sys, self.port, pin, true);
-                    trace!("{} output=1", self.port_str(pin));
-                });
-
-                Self::iter_port_reg_changes(0, reset, 1, |pin, _| {
-                    gpio.write_port(sys, self.port, pin, false);
-                    trace!("{} output=0", self.port_str(pin));
-                });
-
-                self.od &= !reset;
-                self.od |= set;
+                if self.layout != GpioLayout::F1 {
+                    self.layout = GpioLayout::F4;
+                    self.write_bsrr(sys, value);
+                } else {
+                    // F1 LCKR
+                    trace!("GPIO{} port locked", self.port_letter);
+                    self.lck = value;
+                }
             }
             0x001C => {
                 trace!("GPIO{} port locked", self.port_letter);
                 self.lck = value;
             }
             0x0020 => {
+                self.layout = GpioLayout::F4;
                 Self::iter_port_reg_changes(self.afrl, value, 4, |pin, v| {
                     trace!("{} alternate_cfg=AF{}", self.port_str(pin), v);
                 });
                 self.afrl = value;
             }
             0x0024 => {
+                self.layout = GpioLayout::F4;
                 Self::iter_port_reg_changes(self.afrh, value, 4, |pin, v| {
                     trace!("{} alternate_cfg=AF{}", self.port_str(pin+8), v);
                 });

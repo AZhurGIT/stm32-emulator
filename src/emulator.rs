@@ -3,7 +3,7 @@
 use std::{mem::MaybeUninit, sync::atomic::{AtomicU64, Ordering, AtomicBool}, cell::RefCell};
 use svd_parser::svd::Device as SvdDevice;
 use unicorn_engine::{unicorn_const::{Arch, Mode, HookType, MemType}, Unicorn, RegisterARM};
-use crate::{config::Config, util::UniErr, Args, system::System, framebuffers::sdl_engine::{PUMP_EVENT_INST_INTERVAL, SDL}};
+use crate::{config::Config, util::UniErr, unicorn_ctl, Args, system::System, framebuffers::sdl_engine::{PUMP_EVENT_INST_INTERVAL, SDL}};
 use anyhow::{Context as _, Result, bail};
 use capstone::prelude::*;
 
@@ -34,6 +34,9 @@ pub static NUM_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
 static CONTINUE_EXECUTION: AtomicBool = AtomicBool::new(false);
 static BUSY_LOOP_REACHED: AtomicBool = AtomicBool::new(false);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Set from hooks when NVIC delivers an IRQ; `uc_ctl(TB_FLUSH)` must not run inside hooks —
+/// it corrupts QEMU while a TB is active (SIGSEGV in `qemu_xxhash4`). Flush after `emu_start` returns.
+static TB_FLUSH_AFTER_STOP: AtomicBool = AtomicBool::new(false);
 
 fn disassemble_instruction(diassembler: &Capstone, uc: &Unicorn<()>, pc: u64) -> String {
     let mut instr = [0; 4];
@@ -112,10 +115,16 @@ pub fn run_emulator(config: Config, svd_device: SvdDevice, args: Args) -> Result
 
             if n % interrupt_period as u64 == 0 {
                 let sys = System { uc: RefCell::new(uc), p: p.clone(), d: d.clone() };
-                p.nvic.borrow_mut().run_pending_interrupts(&sys, vector_table_addr);
+                let took_irq = p.nvic.borrow_mut().run_pending_interrupts(&sys, vector_table_addr);
+                if took_irq {
+                    // Must exit current TB so the new PC (handler) is fetched; otherwise
+                    // execution can continue at the pre-hook address (e.g. inside IT).
+                    TB_FLUSH_AFTER_STOP.store(true, Ordering::Release);
+                    uc.emu_stop().expect("emu_stop after IRQ");
+                }
             }
 
-            if n & PUMP_EVENT_INST_INTERVAL == 0 {
+            if n % PUMP_EVENT_INST_INTERVAL == 0 {
                 for fb in &framebuffers.sdls {
                     fb.borrow_mut().maybe_redraw();
                 }
@@ -159,10 +168,37 @@ pub fn run_emulator(config: Config, svd_device: SvdDevice, args: Args) -> Result
                     // Return from interrupt
                     let sys = System { uc: RefCell::new(uc), p: p.clone(), d: d.clone() };
                     p.nvic.borrow_mut().return_from_interrupt(&sys);
-                    p.nvic.borrow_mut().run_pending_interrupts(&sys, vector_table_addr);
+                    let took_irq = p.nvic.borrow_mut().run_pending_interrupts(&sys, vector_table_addr);
+                    if took_irq {
+                        TB_FLUSH_AFTER_STOP.store(true, Ordering::Release);
+                        uc.emu_stop().expect("emu_stop after chained IRQ");
+                    }
                 }
                 3 => {
-                    error!("intr_hook intno={:08x}", exception);
+                    // EXCP_PREFETCH_ABORT: often follows `ldr pc, [sp]` with a bad return address,
+                    // or execute from unmapped / non-Thumb PC.
+                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0);
+                    let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0);
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0);
+                    let msp = uc.reg_read(RegisterARM::MSP).unwrap_or(0);
+                    let psp = uc.reg_read(RegisterARM::PSP).unwrap_or(0);
+                    let mut slot = [0u8; 16];
+                    let stack_words = if uc.mem_read(sp, &mut slot).is_ok() {
+                        format!(
+                            "[sp+0]=0x{:08x} [sp+4]=0x{:08x} [sp+8]=0x{:08x} [sp+12]=0x{:08x}",
+                            u32::from_le_bytes(slot[0..4].try_into().unwrap()),
+                            u32::from_le_bytes(slot[4..8].try_into().unwrap()),
+                            u32::from_le_bytes(slot[8..12].try_into().unwrap()),
+                            u32::from_le_bytes(slot[12..16].try_into().unwrap()),
+                        )
+                    } else {
+                        "(stack read failed)".to_string()
+                    };
+                    error!(
+                        "intr_hook PREFETCH_ABORT intno={} pc=0x{:08x} lr=0x{:08x} sp=0x{:08x} msp=0x{:08x} psp=0x{:08x} {}",
+                        exception, pc, lr, sp, msp, psp, stack_words
+                    );
+                    std::process::exit(1);
                 }
                 _ => {
                     error!("intr_hook intno={:08x}", exception);
@@ -213,6 +249,13 @@ pub fn run_emulator(config: Config, svd_device: SvdDevice, args: Args) -> Result
             0,
             max_instructions.unwrap_or(0) as usize,
         ).map_err(UniErr);
+
+        if TB_FLUSH_AFTER_STOP.swap(false, Ordering::AcqRel) {
+            if let Err(e) = unicorn_ctl::tb_flush_all(&uc) {
+                warn!("uc_ctl TB_FLUSH after IRQ stop failed: {:?}", e);
+            }
+        }
+
         pc = uc.reg_read(RegisterARM::PC).expect("failed to get pc");
 
         if STOP_REQUESTED.load(Ordering::Relaxed) {
